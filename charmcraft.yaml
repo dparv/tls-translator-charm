@@ -7,17 +7,30 @@ description: |
   tls-certificates v4 interface for providers like lego or self-signed. It
   handles multiple relations, auto-renewal propagation, and CA distribution.
 
-bases:
-  - name: ubuntu
-    channel: 22.04/stable
+platforms:
+  ubuntu@22.04:amd64:
+
+provides:
+  legacy-certificates:
+    interface: tls-certificates
+
+requires:
+  certificates:
+    interface: tls-certificates
+
+peers:
+  cluster:
+    interface: certificate-translator-peers
 
 parts:
   charm:
     plugin: charm
     source: .
+    build-packages:
+      - libssl-dev
+      - libffi-dev
+      - pkg-config
     charm-python-packages:
       - cryptography>=41
       - charmlibs-interfaces-tls-certificates~=1.0
       - ops>=2.6
-
-actions: {}

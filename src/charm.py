@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import ipaddress
 import json
 import logging
 from dataclasses import dataclass, asdict
@@ -19,9 +20,41 @@ from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, Relation, 
 logger = logging.getLogger(__name__)
 
 
-# Keys used by the legacy (reactive/v1) tls-certificates interface
 LEGACY_CA_KEY = "ca"
 LEGACY_CHAIN_KEY = "chain"
+
+RFC1918_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+]
+
+
+def _is_rfc1918_ip(value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(value)
+        return any(addr in net for net in RFC1918_NETWORKS)
+    except ValueError:
+        return False
+
+
+def _is_non_public_domain(value: str) -> bool:
+    if value.endswith(".lxd"):
+        return True
+    if _is_rfc1918_ip(value):
+        return True
+    return False
+
+
+def _filter_non_public_sans(sans: List[str]) -> List[str]:
+    return [s for s in sans if not _is_non_public_domain(s)]
+
+
+def _request_has_valid_identifiers(req: "V1Request") -> bool:
+    if not _is_non_public_domain(req.cn):
+        return True
+    filtered_sans = _filter_non_public_sans(req.sans)
+    return len(filtered_sans) > 0
 
 
 @dataclass
@@ -118,10 +151,28 @@ class CertificateTranslatorCharm(CharmBase):
         for req in requests:
             if self._legacy_request_already_handled(rel, req):
                 continue
-            # Avoid duplicating CSRs if one already exists for same (rel,unit,cn,req_type)
+            if not _request_has_valid_identifiers(req):
+                logger.warning(
+                    "skipping request CN=%s: no valid public identifiers (all are RFC1918 IP or .lxd domain)",
+                    req.cn,
+                )
+                continue
             if self._csr_for_request_exists(rel.id, req):
                 continue
-            self._create_and_publish_v4_csr(rel, v4_rel, req)
+            filtered_req = V1Request(
+                req_type=req.req_type,
+                unit_key=req.unit_key,
+                cn=req.cn if not _is_non_public_domain(req.cn) else req.sans[0] if req.sans else req.cn,
+                sans=_filter_non_public_sans(req.sans),
+                is_top_level_server=req.is_top_level_server,
+            )
+            if _is_non_public_domain(filtered_req.cn):
+                logger.warning(
+                    "skipping request: CN=%s is non-public and no valid SANs available",
+                    req.cn,
+                )
+                continue
+            self._create_and_publish_v4_csr(rel, v4_rel, filtered_req)
 
         # No immediate response on v1; we'll update v1 when certificates arrive on v4
 
