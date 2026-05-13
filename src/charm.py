@@ -124,10 +124,14 @@ class CertificateTranslatorCharm(CharmBase):
         self.unit.status = MaintenanceStatus("initializing")
 
     def _on_start(self, _):
+        self._backfill_legacy_unit_bags()
         self._republish_pending_csrs()
+        self._sync_from_current_v4_provider()
         self._update_status()
 
     def _on_config_changed(self, _):
+        self._backfill_legacy_unit_bags()
+        self._sync_from_current_v4_provider()
         self._update_status()
 
     def _on_update_status(self, _):
@@ -280,17 +284,17 @@ class CertificateTranslatorCharm(CharmBase):
         # Check if a response has already been written to v1 provider side
         if req.req_type == "server":
             if req.is_top_level_server:
-                cert = rel.data[self.app].get(f"{req.unit_key}.server.cert")
-                key = rel.data[self.app].get(f"{req.unit_key}.server.key")
+                cert = self._legacy_value(rel, f"{req.unit_key}.server.cert")
+                key = self._legacy_value(rel, f"{req.unit_key}.server.key")
                 return bool(cert and key)
             # processed_requests JSON
-            processed = _json_view(rel.data[self.app]).get(f"{req.unit_key}.processed_requests") or {}
+            processed = self._legacy_json(rel, f"{req.unit_key}.processed_requests")
             return req.cn in processed and processed[req.cn].get("cert") and processed[req.cn].get("key")
         if req.req_type == "client":
-            processed = _json_view(rel.data[self.app]).get(f"{req.unit_key}.processed_client_requests") or {}
+            processed = self._legacy_json(rel, f"{req.unit_key}.processed_client_requests")
             return req.cn in processed and processed[req.cn].get("cert") and processed[req.cn].get("key")
         if req.req_type == "application":
-            processed = _json_view(rel.data[self.app]).get(f"{req.unit_key}.processed_application_requests") or {}
+            processed = self._legacy_json(rel, f"{req.unit_key}.processed_application_requests")
             app_data = processed.get("app_data") or {}
             return bool(app_data.get("cert") and app_data.get("key"))
         return False
@@ -398,6 +402,14 @@ class CertificateTranslatorCharm(CharmBase):
     def _on_v4_relation_changed(self, event):
         rel: Relation = event.relation
         logger.debug("v4 relation-changed: %s", rel.id)
+        self._sync_from_v4_relation(rel)
+
+    def _sync_from_current_v4_provider(self):
+        rel = self._get_v4_relation()
+        if rel:
+            self._sync_from_v4_relation(rel)
+
+    def _sync_from_v4_relation(self, rel: Relation):
         # Read provider certificates from v4 (application databag)
         appbag = rel.data.get(rel.app) if rel.app else None
         if not appbag:
@@ -441,34 +453,43 @@ class CertificateTranslatorCharm(CharmBase):
             return
 
         # Publish CA/chain globally (v1 expects one CA+chain across clients)
-        legacy_rel.data[self.app][LEGACY_CA_KEY] = ca_pem
+        for bag in self._legacy_write_bags(legacy_rel):
+            bag[LEGACY_CA_KEY] = ca_pem
         # Concatenate chain as PEM string for v1 consumers
         concatenated_chain = "".join(cert if cert.endswith("\n") else cert + "\n" for cert in chain_list)
-        legacy_rel.data[self.app][LEGACY_CHAIN_KEY] = concatenated_chain
+        for bag in self._legacy_write_bags(legacy_rel):
+            bag[LEGACY_CHAIN_KEY] = concatenated_chain
 
         # Publish certificate and key according to request type
         if rec.req_type == "server":
             if self._is_top_level_for(rec, legacy_rel):
-                legacy_rel.data[self.app][f"{rec.legacy_unit_key}.server.cert"] = cert_pem
-                legacy_rel.data[self.app][f"{rec.legacy_unit_key}.server.key"] = key_pem
+                for bag in self._legacy_write_bags(legacy_rel):
+                    bag[f"{rec.legacy_unit_key}.server.cert"] = cert_pem
+                    bag[f"{rec.legacy_unit_key}.server.key"] = key_pem
             else:
                 processed_key = f"{rec.legacy_unit_key}.processed_requests"
-                current = _json_view(legacy_rel.data[self.app]).get(processed_key) or {}
+                current = self._legacy_json(legacy_rel, processed_key)
                 current[rec.cn] = {"cert": cert_pem, "key": key_pem}
-                legacy_rel.data[self.app][processed_key] = json.dumps(current)
+                payload = json.dumps(current)
+                for bag in self._legacy_write_bags(legacy_rel):
+                    bag[processed_key] = payload
         elif rec.req_type == "client":
             processed_key = f"{rec.legacy_unit_key}.processed_client_requests"
-            current = _json_view(legacy_rel.data[self.app]).get(processed_key) or {}
+            current = self._legacy_json(legacy_rel, processed_key)
             current[rec.cn] = {"cert": cert_pem, "key": key_pem}
-            legacy_rel.data[self.app][processed_key] = json.dumps(current)
+            payload = json.dumps(current)
+            for bag in self._legacy_write_bags(legacy_rel):
+                bag[processed_key] = payload
         elif rec.req_type == "application":
             # Write app cert to all units (schema requires per-unit publish)
             for unit in legacy_rel.units:
                 unit_key = (legacy_rel.data[unit].get("unit_name") or unit.name).replace("/", "_")
                 processed_key = f"{unit_key}.processed_application_requests"
-                data = _json_view(legacy_rel.data[self.app]).get(processed_key) or {}
+                data = self._legacy_json(legacy_rel, processed_key)
                 data["app_data"] = {"cert": cert_pem, "key": key_pem}
-                legacy_rel.data[self.app][processed_key] = json.dumps(data)
+                payload = json.dumps(data)
+                for bag in self._legacy_write_bags(legacy_rel):
+                    bag[processed_key] = payload
 
         logger.info(
             "published translated cert to legacy relation %s for %s (%s)",
@@ -481,14 +502,59 @@ class CertificateTranslatorCharm(CharmBase):
         # If the incoming request was the single-server top-level, we would have seen it earlier
         # We can't directly infer here; assume top-level if a matching top-level CN is present.
         # Safe default: prefer processed_requests; only set top-level if unset.
-        key_cert = rel.data[self.app].get(f"{rec.legacy_unit_key}.server.cert")
-        key_key = rel.data[self.app].get(f"{rec.legacy_unit_key}.server.key")
+        key_cert = self._legacy_value(rel, f"{rec.legacy_unit_key}.server.cert")
+        key_key = self._legacy_value(rel, f"{rec.legacy_unit_key}.server.key")
         return not (key_cert or key_key)
 
     # ------------------------------- Helpers ---------------------------------
     def _get_v4_relation(self) -> Optional[Relation]:
         rels = self.model.relations.get("certificates", [])
         return rels[0] if rels else None
+
+    def _backfill_legacy_unit_bags(self):
+        for rel in self.model.relations.get("legacy-certificates", []):
+            self._backfill_legacy_unit_bag(rel)
+
+    def _backfill_legacy_unit_bag(self, rel: Relation):
+        app_bag = rel.data[self.app]
+        unit_bag = rel.data[self.unit]
+        copied = False
+        for key, value in app_bag.items():
+            if key in {LEGACY_CA_KEY, LEGACY_CHAIN_KEY} or key.endswith(
+                (
+                    ".server.cert",
+                    ".server.key",
+                    ".processed_requests",
+                    ".processed_client_requests",
+                    ".processed_application_requests",
+                )
+            ):
+                if value and not unit_bag.get(key):
+                    unit_bag[key] = value
+                    copied = True
+        if copied:
+            logger.info("backfilled legacy TLS data into unit bag for relation %s", rel.id)
+
+    def _legacy_write_bags(self, rel: Relation):
+        return (rel.data[self.unit], rel.data[self.app])
+
+    def _legacy_value(self, rel: Relation, key: str) -> Optional[str]:
+        for bag in self._legacy_write_bags(rel):
+            value = bag.get(key)
+            if value:
+                return value
+        return None
+
+    def _legacy_json(self, rel: Relation, key: str) -> Dict[str, dict]:
+        for bag in self._legacy_write_bags(rel):
+            value = bag.get(key)
+            if not value:
+                continue
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                continue
+        return {}
 
 
 def _json_view(bag: Dict[str, str]) -> Dict[str, dict]:

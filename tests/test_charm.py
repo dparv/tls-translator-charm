@@ -141,12 +141,19 @@ def test_v4_certificate_publishes_back_to_v1(monkeypatch):
 
     # Verify CA and chain
     legacy_app_data = h.get_relation_data(legacy_rel_id, h.charm.app.name)
+    legacy_unit_data = h.get_relation_data(legacy_rel_id, h.charm.unit.name)
     assert legacy_app_data.get("ca") == "CA-PEM"
     assert "CERT-PEM" in legacy_app_data.get("chain", "")
     assert "CA-PEM" in legacy_app_data.get("chain", "")
+    assert legacy_unit_data.get("ca") == "CA-PEM"
+    assert "CERT-PEM" in legacy_unit_data.get("chain", "")
+    assert "CA-PEM" in legacy_unit_data.get("chain", "")
 
     # Verify processed_requests contains cert + key
     processed_key = "keystone_0.processed_requests"
     processed = json.loads(legacy_app_data.get(processed_key, "{}"))
+    processed_unit = json.loads(legacy_unit_data.get(processed_key, "{}"))
     assert processed["api.example.com"]["cert"] == "CERT-PEM"
     assert processed["api.example.com"]["key"] == "FAKE-KEY"
+    assert processed_unit["api.example.com"]["cert"] == "CERT-PEM"
+    assert processed_unit["api.example.com"]["key"] == "FAKE-KEY"

@@ -1,5 +1,6 @@
 stage/
 parts/
+*.pyc
 prime/
 .craft/packed-files
 *.charm
