@@ -106,19 +106,33 @@ class CertificateTranslatorCharm(CharmBase):
 
         # v4 side (requires): provider posts certificates to app databag.
         self.framework.observe(
+            self.on["certificates"].relation_created, self._on_v4_relation_created
+        )
+        self.framework.observe(
             self.on["certificates"].relation_changed, self._on_v4_relation_changed
+        )
+        self.framework.observe(
+            self.on["certificates"].relation_joined, self._on_v4_relation_joined
         )
 
         self.framework.observe(self.on.install, self._on_install)
         self.framework.observe(self.on.update_status, self._on_update_status)
+        self.framework.observe(self.on.start, self._on_start)
+        self.framework.observe(self.on.config_changed, self._on_config_changed)
 
     def _on_install(self, _):
         self.unit.status = MaintenanceStatus("initializing")
 
+    def _on_start(self, _):
+        self._republish_pending_csrs()
+        self._update_status()
+
+    def _on_config_changed(self, _):
+        self._update_status()
+
     def _on_update_status(self, _):
-        # Simple health checks
         if not self.model.relations.get("certificates"):
-            self.unit.status = BlockedStatus("relate to a v4 provider (lego:certificates)")
+            self.unit.status = BlockedStatus("relate to a v4 TLS certificates provider")
             return
         if not self.model.relations.get("legacy-certificates"):
             self.unit.status = BlockedStatus("awaiting legacy tls-certificates requirers")
@@ -339,6 +353,46 @@ class CertificateTranslatorCharm(CharmBase):
         m = dict(self.state.csr_map)
         m[csr_sha] = json.dumps(asdict(rec))
         self.state.csr_map = m
+
+    def _on_v4_relation_created(self, event):
+        logger.info("v4 relation-created: %s, republishing pending CSRs", event.relation.id)
+        self._republish_pending_csrs()
+        self._update_status()
+
+    def _on_v4_relation_joined(self, event):
+        logger.debug("v4 relation-joined: %s", event.relation.id)
+        self._republish_pending_csrs()
+        self._update_status()
+
+    def _update_status(self):
+        if not self.model.relations.get("certificates"):
+            self.unit.status = BlockedStatus("relate to a v4 TLS certificates provider")
+            return
+        if not self.model.relations.get("legacy-certificates"):
+            self.unit.status = BlockedStatus("awaiting legacy tls-certificates requirers")
+            return
+        self.unit.status = ActiveStatus("bridge operational")
+
+    def _republish_pending_csrs(self):
+        v4_rel = self._get_v4_relation()
+        if not v4_rel:
+            return
+        csr_map = dict(self.state.csr_map)
+        if not csr_map:
+            return
+        rdata = v4_rel.data[self.unit]
+        try:
+            current = json.loads(rdata.get("certificate_signing_requests", "[]"))
+        except json.JSONDecodeError:
+            current = []
+        existing_csrs = {x.get("certificate_signing_request", "").strip() for x in current}
+        for csr_sha, payload in csr_map.items():
+            rec = CsrRecord(**json.loads(payload))
+            csr_pem = rec.csr_pem.strip()
+            if csr_pem not in existing_csrs:
+                current.append({"certificate_signing_request": csr_pem, "ca": False})
+                logger.info("republished CSR for CN=%s to v4 provider", rec.cn)
+        rdata["certificate_signing_requests"] = json.dumps(current)
 
     # ------------------------------- v4 side ---------------------------------
     def _on_v4_relation_changed(self, event):
