@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+
+import json
+import logging
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple
+
+from charmlibs.interfaces.tls_certificates import (
+    Certificate,
+    CertificateRequestAttributes,
+    CertificateSigningRequest,
+    PrivateKey,
+)
+from ops import main
+from ops.charm import CharmBase
+from ops.framework import StoredState
+from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, Relation, Unit
+
+logger = logging.getLogger(__name__)
+
+
+# Keys used by the legacy (reactive/v1) tls-certificates interface
+LEGACY_CA_KEY = "ca"
+LEGACY_CHAIN_KEY = "chain"
+
+
+@dataclass
+class V1Request:
+    # type: 'server' | 'client' | 'application'
+    req_type: str
+    # legacy unit requesting (unit name encoded with '/' -> '_')
+    unit_key: str
+    # common name for the certificate
+    cn: str
+    # list of SANs (strings, DNS/IP)
+    sans: List[str]
+    # whether this is the top-level single server request (special fields)
+    is_top_level_server: bool = False
+
+
+@dataclass
+class CsrRecord:
+    # sha256 of the CSR (hex) for quick mapping (derived at runtime)
+    csr_sha: str
+    # raw CSR as PEM
+    csr_pem: str
+    # secret label storing the private key
+    secret_label: str
+    # legacy relation id and addressing info
+    legacy_relation_id: int
+    legacy_unit_key: str
+    req_type: str
+    cn: str
+
+
+class CertificateTranslatorCharm(CharmBase):
+    state = StoredState()
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        # Stored mappings: csr_sha -> CsrRecord (dict serialized as JSON)
+        self.state.set_default(csr_map={})
+
+        # Legacy v1 side: provider
+        self.framework.observe(
+            self.on["legacy-certificates"].relation_changed,
+            self._on_legacy_relation_changed,
+        )
+        self.framework.observe(
+            self.on["legacy-certificates"].relation_broken,
+            self._on_legacy_relation_broken,
+        )
+
+        # v4 side (requires): provider posts certificates to app databag.
+        self.framework.observe(
+            self.on["certificates"].relation_changed, self._on_v4_relation_changed
+        )
+
+        self.framework.observe(self.on.install, self._on_install)
+        self.framework.observe(self.on.update_status, self._on_update_status)
+
+    def _on_install(self, _):
+        self.unit.status = MaintenanceStatus("initializing")
+
+    def _on_update_status(self, _):
+        # Simple health checks
+        if not self.model.relations.get("certificates"):
+            self.unit.status = BlockedStatus("relate to a v4 provider (lego:certificates)")
+            return
+        if not self.model.relations.get("legacy-certificates"):
+            self.unit.status = BlockedStatus("awaiting legacy tls-certificates requirers")
+            return
+        self.unit.status = ActiveStatus("bridge operational")
+
+    # ----------------------------- Legacy v1 side -----------------------------
+    def _on_legacy_relation_changed(self, event):
+        rel: Relation = event.relation
+        logger.debug("v1 relation-changed: %s", rel.id)
+        # Process legacy requests and create CSRs in v4 relation
+        try:
+            requests = self._collect_legacy_requests(rel)
+        except Exception as e:
+            logger.exception("failed to parse legacy requests: %s", e)
+            self.unit.status = BlockedStatus("invalid v1 request data")
+            return
+
+        if not requests:
+            # Nothing to do
+            return
+
+        # Ensure v4 relation exists
+        v4_rel = self._get_v4_relation()
+        if not v4_rel:
+            self.unit.status = BlockedStatus("relate :certificates to a v4 provider (lego)")
+            return
+
+        # For each outstanding legacy request, generate key + CSR and publish to v4
+        for req in requests:
+            if self._legacy_request_already_handled(rel, req):
+                continue
+            # Avoid duplicating CSRs if one already exists for same (rel,unit,cn,req_type)
+            if self._csr_for_request_exists(rel.id, req):
+                continue
+            self._create_and_publish_v4_csr(rel, v4_rel, req)
+
+        # No immediate response on v1; we'll update v1 when certificates arrive on v4
+
+    def _on_legacy_relation_broken(self, event):
+        # Clean up any CSR mappings for this relation
+        rel_id = event.relation.id
+        csr_map = dict(self.state.csr_map)
+        to_delete = [k for k, v in csr_map.items() if json.loads(v)["legacy_relation_id"] == rel_id]
+        for key in to_delete:
+            del csr_map[key]
+        self.state.csr_map = csr_map
+
+    # Parse requests from the v1 interface (reactive schema)
+    def _collect_legacy_requests(self, rel: Relation) -> List[V1Request]:
+        reqs: List[V1Request] = []
+        # Per-unit requests
+        for unit in rel.units:
+            reqs.extend(self._parse_unit_requests(rel, unit))
+        # Application-scoped (aggregated) requests
+        reqs.extend(self._parse_application_requests(rel))
+        return reqs
+
+    def _parse_unit_requests(self, rel: Relation, unit: Unit) -> List[V1Request]:
+        data_raw = rel.data[unit]
+        data_json = _json_view(data_raw)
+        unit_name_key = data_raw.get("unit_name") or unit.name.replace("/", "_")
+        out: List[V1Request] = []
+
+        # First/top-level server cert request (back-compat fields)
+        cn = data_raw.get("common_name")
+        sans = data_json.get("sans") or []
+        if cn:
+            out.append(
+                V1Request(
+                    req_type="server",
+                    unit_key=unit_name_key,
+                    cn=cn,
+                    sans=list(sans),
+                    is_top_level_server=True,
+                )
+            )
+
+        # Multi server cert requests
+        cert_reqs = data_json.get("cert_requests") or {}
+        for common_name, payload in cert_reqs.items():
+            out.append(
+                V1Request(
+                    req_type="server",
+                    unit_key=unit_name_key,
+                    cn=common_name,
+                    sans=list(payload.get("sans", [])),
+                    is_top_level_server=False,
+                )
+            )
+
+        # Client cert requests
+        client_reqs = data_json.get("client_cert_requests") or {}
+        for common_name, payload in client_reqs.items():
+            out.append(
+                V1Request(
+                    req_type="client",
+                    unit_key=unit_name_key,
+                    cn=common_name,
+                    sans=list(payload.get("sans", [])),
+                )
+            )
+        return out
+
+    def _parse_application_requests(self, rel: Relation) -> List[V1Request]:
+        # Aggregate all units' app requests by common_name
+        aggregate: Dict[str, List[str]] = {}
+        for unit in rel.units:
+            data_json = _json_view(rel.data[unit])
+            app_reqs = data_json.get("application_cert_requests") or {}
+            for cn, payload in app_reqs.items():
+                items = aggregate.setdefault(cn, [])
+                items.append(cn)
+                items.extend(list(payload.get("sans", [])))
+        out: List[V1Request] = []
+        if not aggregate:
+            return out
+        # Use leader's unit_key for placement of processed application result back per unit
+        unit_key = self.unit.name.replace("/", "_")
+        for cn, sans in aggregate.items():
+            # de-duplicate and sort for stability
+            uniq_sans = sorted(set(sans))
+            out.append(V1Request(req_type="application", unit_key=unit_key, cn=cn, sans=uniq_sans))
+        return out
+
+    def _legacy_request_already_handled(self, rel: Relation, req: V1Request) -> bool:
+        # Check if a response has already been written to v1 provider side
+        if req.req_type == "server":
+            if req.is_top_level_server:
+                cert = rel.data[self.app].get(f"{req.unit_key}.server.cert")
+                key = rel.data[self.app].get(f"{req.unit_key}.server.key")
+                return bool(cert and key)
+            # processed_requests JSON
+            processed = _json_view(rel.data[self.app]).get(f"{req.unit_key}.processed_requests") or {}
+            return req.cn in processed and processed[req.cn].get("cert") and processed[req.cn].get("key")
+        if req.req_type == "client":
+            processed = _json_view(rel.data[self.app]).get(f"{req.unit_key}.processed_client_requests") or {}
+            return req.cn in processed and processed[req.cn].get("cert") and processed[req.cn].get("key")
+        if req.req_type == "application":
+            processed = _json_view(rel.data[self.app]).get(f"{req.unit_key}.processed_application_requests") or {}
+            app_data = processed.get("app_data") or {}
+            return bool(app_data.get("cert") and app_data.get("key"))
+        return False
+
+    def _csr_for_request_exists(self, legacy_rel_id: int, req: V1Request) -> bool:
+        # Look for any csr record matching this legacy request identification
+        for payload in self.state.csr_map.values():
+            rec = CsrRecord(**json.loads(payload))
+            if (
+                rec.legacy_relation_id == legacy_rel_id
+                and rec.legacy_unit_key == req.unit_key
+                and rec.req_type == req.req_type
+                and rec.cn == req.cn
+            ):
+                return True
+        return False
+
+    def _create_and_publish_v4_csr(self, legacy_rel: Relation, v4_rel: Relation, req: V1Request):
+        # Generate private key and CSR
+        pk = PrivateKey.generate()
+        attrs = CertificateRequestAttributes(
+            common_name=req.cn,
+            sans_dns=set(req.sans) if req.sans else None,
+            # Leave add_unique_id_to_subject_name=True for safer deduplication
+        )
+        csr = attrs.generate_csr(private_key=pk)
+        csr_sha = csr.get_sha256_hex()
+
+        # Store private key as a secret, label derived from CSR sha
+        secret_label = f"tls-translator-key-{csr_sha}"
+        try:
+            secret = self.model.get_secret(label=secret_label)
+            secret.set_content({"private-key": str(pk)})
+            secret.get_content(refresh=True)
+        except Exception:
+            self.unit.add_secret({"private-key": str(pk)}, label=secret_label)
+
+        # Append CSR to v4 relation data (application or unit databag as requirer). Use unit databag.
+        rdata = v4_rel.data[self.unit]
+        try:
+            current = json.loads(rdata.get("certificate_signing_requests", "[]"))
+        except json.JSONDecodeError:
+            current = []
+        # Avoid duplicates
+        if not any(x.get("certificate_signing_request") == str(csr).strip() for x in current):
+            current.append({"certificate_signing_request": str(csr).strip(), "ca": False})
+            rdata["certificate_signing_requests"] = json.dumps(current)
+            logger.info("queued CSR for CN=%s on v4", req.cn)
+
+        # Persist mapping
+        rec = CsrRecord(
+            csr_sha=csr_sha,
+            csr_pem=str(csr),
+            secret_label=secret_label,
+            legacy_relation_id=legacy_rel.id,
+            legacy_unit_key=req.unit_key,
+            req_type=req.req_type,
+            cn=req.cn,
+        )
+        m = dict(self.state.csr_map)
+        m[csr_sha] = json.dumps(asdict(rec))
+        self.state.csr_map = m
+
+    # ------------------------------- v4 side ---------------------------------
+    def _on_v4_relation_changed(self, event):
+        rel: Relation = event.relation
+        logger.debug("v4 relation-changed: %s", rel.id)
+        # Read provider certificates from v4 (application databag)
+        appbag = rel.data.get(rel.app) if rel.app else None
+        if not appbag:
+            return
+        try:
+            provider_entries = json.loads(appbag.get("certificates", "[]"))
+        except json.JSONDecodeError:
+            logger.warning("invalid v4 provider databag format")
+            return
+
+        for entry in provider_entries:
+            csr_pem = entry.get("certificate_signing_request", "").strip()
+            cert_pem = entry.get("certificate")
+            ca_pem = entry.get("ca")
+            chain_list = entry.get("chain") or []
+            if not (csr_pem and cert_pem and ca_pem):
+                continue
+            csr_sha = CertificateSigningRequest.from_string(csr_pem).get_sha256_hex()
+            rec = self._lookup_csr_record(csr_sha)
+            if not rec:
+                continue
+            self._publish_to_legacy(rec, cert_pem, ca_pem, chain_list)
+
+    def _lookup_csr_record(self, csr_sha: str) -> Optional[CsrRecord]:
+        payload = self.state.csr_map.get(csr_sha)
+        return CsrRecord(**json.loads(payload)) if payload else None
+
+    def _publish_to_legacy(
+        self, rec: CsrRecord, cert_pem: str, ca_pem: str, chain_list: List[str]
+    ) -> None:
+        legacy_rel = self.model.get_relation("legacy-certificates", rec.legacy_relation_id)
+        if not legacy_rel:
+            logger.warning("legacy relation %s not found for CSR %s", rec.legacy_relation_id, rec.csr_sha)
+            return
+        # Load the private key from secret
+        try:
+            secret = self.model.get_secret(label=rec.secret_label)
+            key_pem = secret.get_content(refresh=True).get("private-key")
+        except Exception:
+            logger.warning("secret %s not available for CSR %s", rec.secret_label, rec.csr_sha)
+            return
+
+        # Publish CA/chain globally (v1 expects one CA+chain across clients)
+        legacy_rel.data[self.app][LEGACY_CA_KEY] = ca_pem
+        # Concatenate chain as PEM string for v1 consumers
+        concatenated_chain = "".join(cert if cert.endswith("\n") else cert + "\n" for cert in chain_list)
+        legacy_rel.data[self.app][LEGACY_CHAIN_KEY] = concatenated_chain
+
+        # Publish certificate and key according to request type
+        if rec.req_type == "server":
+            if self._is_top_level_for(rec, legacy_rel):
+                legacy_rel.data[self.app][f"{rec.legacy_unit_key}.server.cert"] = cert_pem
+                legacy_rel.data[self.app][f"{rec.legacy_unit_key}.server.key"] = key_pem
+            else:
+                processed_key = f"{rec.legacy_unit_key}.processed_requests"
+                current = _json_view(legacy_rel.data[self.app]).get(processed_key) or {}
+                current[rec.cn] = {"cert": cert_pem, "key": key_pem}
+                legacy_rel.data[self.app][processed_key] = json.dumps(current)
+        elif rec.req_type == "client":
+            processed_key = f"{rec.legacy_unit_key}.processed_client_requests"
+            current = _json_view(legacy_rel.data[self.app]).get(processed_key) or {}
+            current[rec.cn] = {"cert": cert_pem, "key": key_pem}
+            legacy_rel.data[self.app][processed_key] = json.dumps(current)
+        elif rec.req_type == "application":
+            # Write app cert to all units (schema requires per-unit publish)
+            for unit in legacy_rel.units:
+                unit_key = (legacy_rel.data[unit].get("unit_name") or unit.name).replace("/", "_")
+                processed_key = f"{unit_key}.processed_application_requests"
+                data = _json_view(legacy_rel.data[self.app]).get(processed_key) or {}
+                data["app_data"] = {"cert": cert_pem, "key": key_pem}
+                legacy_rel.data[self.app][processed_key] = json.dumps(data)
+
+        logger.info(
+            "published translated cert to legacy relation %s for %s (%s)",
+            rec.legacy_relation_id,
+            rec.cn,
+            rec.req_type,
+        )
+
+    def _is_top_level_for(self, rec: CsrRecord, rel: Relation) -> bool:
+        # If the incoming request was the single-server top-level, we would have seen it earlier
+        # We can't directly infer here; assume top-level if a matching top-level CN is present.
+        # Safe default: prefer processed_requests; only set top-level if unset.
+        key_cert = rel.data[self.app].get(f"{rec.legacy_unit_key}.server.cert")
+        key_key = rel.data[self.app].get(f"{rec.legacy_unit_key}.server.key")
+        return not (key_cert or key_key)
+
+    # ------------------------------- Helpers ---------------------------------
+    def _get_v4_relation(self) -> Optional[Relation]:
+        rels = self.model.relations.get("certificates", [])
+        return rels[0] if rels else None
+
+
+def _json_view(bag: Dict[str, str]) -> Dict[str, dict]:
+    out = {}
+    for k, v in bag.items():
+        try:
+            out[k] = json.loads(v)
+        except Exception:
+            # not JSON, ignore
+            pass
+    return out
+
+
+if __name__ == "__main__":
+    main(CertificateTranslatorCharm)

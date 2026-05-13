@@ -1,0 +1,24 @@
+name: certificate-translator
+summary: Translate tls-certificates v1 to v4
+description: |
+  Bridges legacy tls-certificates v1 interface from reactive OpenStack charms
+  to modern tls-certificates v4 providers such as lego-operator. The charm
+  generates CSRs and keys per request, forwards to the provider, and publishes
+  certificates and keys back over the legacy relation.
+
+maintainer: Canonical Field Engineering
+
+series:
+  - jammy
+
+provides:
+  legacy-certificates:
+    interface: tls-certificates
+
+requires:
+  certificates:
+    interface: tls-certificates
+
+peers:
+  cluster:
+    interface: certificate-translator-peers

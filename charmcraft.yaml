@@ -1,0 +1,23 @@
+type: charm
+name: certificate-translator
+summary: Translate tls-certificates v1 requests to v4 providers (e.g. lego)
+description: |
+  A sidecar-less machine charm that provides the legacy tls-certificates (v1)
+  interface to OpenStack reactive charms and translates requests to the modern
+  tls-certificates v4 interface for providers like lego or self-signed. It
+  handles multiple relations, auto-renewal propagation, and CA distribution.
+
+bases:
+  - name: ubuntu
+    channel: 22.04/stable
+
+parts:
+  charm:
+    plugin: charm
+    source: .
+    charm-python-packages:
+      - cryptography>=41
+      - charmlibs-interfaces-tls-certificates~=1.0
+      - ops>=2.6
+
+actions: {}

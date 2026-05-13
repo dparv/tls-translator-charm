@@ -1,0 +1,41 @@
+The is the issue:
+
+The charmed-openstack charms implement an old version of the tls-certificates interface. This is incompatible with newer versions such as lego or newer versions of vault. My proposal is to write a translator charm, that can integrate with the old interface of the openstack charms as well as the current interface. It will then translate all certificate requests from the old interface to the new and forward it to the provider via the newer interface. Once it receives the certificate from the provider via the new interface, it will translate this to the old one and forward back to the openstack charms. 
+
+How critical is this idea to the success of the product?
+Automated certificate renewal via acme/let’s encrypt is not critical, but as I understand the certificate authorities are getting more reluctant to give certificates with longer validity (i.e. it is getting more expensive) and manually requesting and configuring certificates every three months is cumbersome. We already see this on the Prodstacks.
+
+What are the functional requirements and acceptance criteria of the requested solution?
+The charm needs to be able to handle multiple openstack charms at once
+
+The charm should handle auto renewal
+
+cos integration for alerting if something goes wrong
+
+What other considerations need to be factored in (eg security, compliance, stability)
+
+Please provide an outline of the proposed solution and example use-case:
+See above for a description of how the charm should work. Use case:
+
+deploy charmed keystone
+
+relate all tls enabled charms to certificate-translator
+
+relate certificate-translator to lego
+
+configure lego to request certificates from letsencrypt
+
+So you need to fetch how old certificates are done between (v1):
+ - https://code.launchpad.net/charm-keystone and https://github.com/canonical/self-signed-certificates-operator
+
+Then fetch how the new lego charm does certifiates relation (v4):
+ - https://github.com/canonical/lego-operator
+
+And you need to write a normal charm (without any binaries) that will do the translataion between a deployed charm-keystone and lego-operator, as those are not compatible right now.
+
+Then:
+ - bootstrap a local lxd juju controller
+ - juju add model tls-test
+ - juju deploy keystone charm
+ - juju deloy lego charm
+ - juju integrate both charms
