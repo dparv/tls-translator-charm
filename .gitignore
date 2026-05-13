@@ -1,1 +1,4 @@
 stage/
+prime/
+.craft/packed-files
+*.charm
