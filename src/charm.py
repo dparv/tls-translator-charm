@@ -4,13 +4,14 @@ import ipaddress
 import json
 import logging
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from charmlibs.interfaces.tls_certificates import (
     Certificate,
     CertificateRequestAttributes,
     CertificateSigningRequest,
     PrivateKey,
+    TLSCertificatesRequiresV4,
 )
 from ops import main
 from ops.charm import CharmBase
@@ -84,6 +85,8 @@ class CsrRecord:
     legacy_unit_key: str
     req_type: str
     cn: str
+    # SANs for reconstructing certificate requests
+    sans: List[str] = None
 
 
 class CertificateTranslatorCharm(CharmBase):
@@ -94,6 +97,21 @@ class CertificateTranslatorCharm(CharmBase):
         # Stored mappings: csr_sha -> CsrRecord (dict serialized as JSON)
         self.state.set_default(csr_map={})
 
+        # Build the current list of certificate requests from stored state
+        certificate_requests = self._build_certificate_requests_from_state()
+
+        # v4 side: delegate CSR lifecycle to TLSCertificatesRequiresV4
+        self.tls = TLSCertificatesRequiresV4(
+            charm=self,
+            relationship_name="certificates",
+            certificate_requests=certificate_requests,
+        )
+
+        # Listen for certificates coming back from the v4 provider
+        self.framework.observe(
+            self.tls.on.certificate_available, self._on_certificate_available
+        )
+
         # Legacy v1 side: provider
         self.framework.observe(
             self.on["legacy-certificates"].relation_changed,
@@ -102,17 +120,6 @@ class CertificateTranslatorCharm(CharmBase):
         self.framework.observe(
             self.on["legacy-certificates"].relation_broken,
             self._on_legacy_relation_broken,
-        )
-
-        # v4 side (requires): provider posts certificates to app databag.
-        self.framework.observe(
-            self.on["certificates"].relation_created, self._on_v4_relation_created
-        )
-        self.framework.observe(
-            self.on["certificates"].relation_changed, self._on_v4_relation_changed
-        )
-        self.framework.observe(
-            self.on["certificates"].relation_joined, self._on_v4_relation_joined
         )
 
         self.framework.observe(self.on.install, self._on_install)
@@ -125,13 +132,12 @@ class CertificateTranslatorCharm(CharmBase):
 
     def _on_start(self, _):
         self._backfill_legacy_unit_bags()
-        self._republish_pending_csrs()
-        self._sync_from_current_v4_provider()
+        self._refresh_v4_certificate_requests()
         self._update_status()
 
     def _on_config_changed(self, _):
         self._backfill_legacy_unit_bags()
-        self._sync_from_current_v4_provider()
+        self._refresh_v4_certificate_requests()
         self._update_status()
 
     def _on_update_status(self, _):
@@ -202,6 +208,8 @@ class CertificateTranslatorCharm(CharmBase):
         for key in to_delete:
             del csr_map[key]
         self.state.csr_map = csr_map
+        # Refresh v4 requests to remove orphaned CSRs
+        self._refresh_v4_certificate_requests()
 
     # Parse requests from the v1 interface (reactive schema)
     def _collect_legacy_requests(self, rel: Relation) -> List[V1Request]:
@@ -300,73 +308,89 @@ class CertificateTranslatorCharm(CharmBase):
         return False
 
     def _csr_for_request_exists(self, legacy_rel_id: int, req: V1Request) -> bool:
-        # Look for any csr record matching this legacy request identification
-        for payload in self.state.csr_map.values():
-            rec = CsrRecord(**json.loads(payload))
-            if (
-                rec.legacy_relation_id == legacy_rel_id
-                and rec.legacy_unit_key == req.unit_key
-                and rec.req_type == req.req_type
-                and rec.cn == req.cn
-            ):
-                return True
-        return False
+        map_key = f"{legacy_rel_id}:{req.unit_key}:{req.req_type}:{req.cn}"
+        return map_key in self.state.csr_map
 
     def _create_and_publish_v4_csr(self, legacy_rel: Relation, v4_rel: Relation, req: V1Request):
-        # Generate private key and CSR
-        pk = PrivateKey.generate()
+        # Build certificate request attributes for this legacy request
         attrs = CertificateRequestAttributes(
             common_name=req.cn,
             sans_dns=set(req.sans) if req.sans else None,
-            # Leave add_unique_id_to_subject_name=True for safer deduplication
         )
-        csr = attrs.generate_csr(private_key=pk)
-        csr_sha = csr.get_sha256_hex()
 
-        # Store private key as a secret, label derived from CSR sha
-        secret_label = f"tls-translator-key-{csr_sha}"
-        try:
-            secret = self.model.get_secret(label=secret_label)
-            secret.set_content({"private-key": str(pk)})
-            secret.get_content(refresh=True)
-        except Exception:
-            self.unit.add_secret({"private-key": str(pk)}, label=secret_label)
-
-        # Append CSR to v4 relation data (application or unit databag as requirer). Use unit databag.
-        rdata = v4_rel.data[self.unit]
-        try:
-            current = json.loads(rdata.get("certificate_signing_requests", "[]"))
-        except json.JSONDecodeError:
-            current = []
-        # Avoid duplicates
-        if not any(x.get("certificate_signing_request") == str(csr).strip() for x in current):
-            current.append({"certificate_signing_request": str(csr).strip(), "ca": False})
-            rdata["certificate_signing_requests"] = json.dumps(current)
-            logger.info("queued CSR for CN=%s on v4", req.cn)
-
-        # Persist mapping
+        # Persist mapping (use CN as key since the library manages CSR generation)
         rec = CsrRecord(
-            csr_sha=csr_sha,
-            csr_pem=str(csr),
-            secret_label=secret_label,
+            csr_sha="",  # Will be populated when certificate arrives
+            csr_pem="",  # Managed by the library
+            secret_label="",  # Private key managed by the library
             legacy_relation_id=legacy_rel.id,
             legacy_unit_key=req.unit_key,
             req_type=req.req_type,
             cn=req.cn,
+            sans=req.sans,
         )
+        # Use a stable key based on legacy relation + unit + type + cn
+        map_key = f"{legacy_rel.id}:{req.unit_key}:{req.req_type}:{req.cn}"
         m = dict(self.state.csr_map)
-        m[csr_sha] = json.dumps(asdict(rec))
+        m[map_key] = json.dumps(asdict(rec))
         self.state.csr_map = m
 
-    def _on_v4_relation_created(self, event):
-        logger.info("v4 relation-created: %s, republishing pending CSRs", event.relation.id)
-        self._republish_pending_csrs()
-        self._update_status()
+        # Update the library's certificate requests and trigger sync
+        self._refresh_v4_certificate_requests()
+        logger.info("queued CSR for CN=%s on v4 via library sync", req.cn)
 
-    def _on_v4_relation_joined(self, event):
-        logger.debug("v4 relation-joined: %s", event.relation.id)
-        self._republish_pending_csrs()
-        self._update_status()
+    def _on_certificate_available(self, event):
+        """Handle certificate_available events from the v4 library."""
+        csr = event.certificate_signing_request
+        cert_pem = str(event.certificate)
+        ca_pem = str(event.ca)
+        chain_list = [str(c) for c in event.chain]
+
+        # Find the matching legacy record by matching the CSR's CN/SANs
+        csr_attrs = CertificateRequestAttributes.from_csr(csr, is_ca=False)
+        rec = self._lookup_record_by_attrs(csr_attrs)
+        if not rec:
+            logger.debug("No legacy mapping found for certificate CN=%s", csr_attrs.common_name)
+            return
+
+        # Get private key from the library
+        private_key = self.tls.get_private_key()
+        if not private_key:
+            logger.warning("Private key not available from v4 library")
+            return
+
+        self._publish_to_legacy(rec, cert_pem, ca_pem, chain_list, str(private_key))
+
+    def _lookup_record_by_attrs(self, attrs: CertificateRequestAttributes) -> Optional[CsrRecord]:
+        """Find a CsrRecord matching the given certificate request attributes."""
+        for payload in self.state.csr_map.values():
+            rec = CsrRecord(**json.loads(payload))
+            if rec.cn == attrs.common_name:
+                return rec
+        return None
+
+    def _build_certificate_requests_from_state(self) -> list:
+        """Build CertificateRequestAttributes list from stored csr_map."""
+        requests = []
+        seen = set()
+        for payload in self.state.csr_map.values():
+            rec = CsrRecord(**json.loads(payload))
+            if rec.cn not in seen:
+                seen.add(rec.cn)
+                sans = rec.sans if rec.sans else None
+                requests.append(CertificateRequestAttributes(
+                    common_name=rec.cn,
+                    sans_dns=set(sans) if sans else None,
+                ))
+        return requests
+
+    def _refresh_v4_certificate_requests(self):
+        """Update the library's certificate requests from state and trigger sync."""
+        from charmlibs.interfaces.tls_certificates import Mode
+        requests = self._build_certificate_requests_from_state()
+        self.tls.certificate_requests = requests
+        self.tls._certificate_mode_map = {r: Mode.UNIT for r in requests}
+        self.tls.sync()
 
     def _update_status(self):
         if not self.model.relations.get("certificates"):
@@ -377,79 +401,15 @@ class CertificateTranslatorCharm(CharmBase):
             return
         self.unit.status = ActiveStatus("bridge operational")
 
-    def _republish_pending_csrs(self):
-        v4_rel = self._get_v4_relation()
-        if not v4_rel:
-            return
-        csr_map = dict(self.state.csr_map)
-        if not csr_map:
-            return
-        rdata = v4_rel.data[self.unit]
-        try:
-            current = json.loads(rdata.get("certificate_signing_requests", "[]"))
-        except json.JSONDecodeError:
-            current = []
-        existing_csrs = {x.get("certificate_signing_request", "").strip() for x in current}
-        for csr_sha, payload in csr_map.items():
-            rec = CsrRecord(**json.loads(payload))
-            csr_pem = rec.csr_pem.strip()
-            if csr_pem not in existing_csrs:
-                current.append({"certificate_signing_request": csr_pem, "ca": False})
-                logger.info("republished CSR for CN=%s to v4 provider", rec.cn)
-        rdata["certificate_signing_requests"] = json.dumps(current)
-
     # ------------------------------- v4 side ---------------------------------
-    def _on_v4_relation_changed(self, event):
-        rel: Relation = event.relation
-        logger.debug("v4 relation-changed: %s", rel.id)
-        self._sync_from_v4_relation(rel)
-
-    def _sync_from_current_v4_provider(self):
-        rel = self._get_v4_relation()
-        if rel:
-            self._sync_from_v4_relation(rel)
-
-    def _sync_from_v4_relation(self, rel: Relation):
-        # Read provider certificates from v4 (application databag)
-        appbag = rel.data.get(rel.app) if rel.app else None
-        if not appbag:
-            return
-        try:
-            provider_entries = json.loads(appbag.get("certificates", "[]"))
-        except json.JSONDecodeError:
-            logger.warning("invalid v4 provider databag format")
-            return
-
-        for entry in provider_entries:
-            csr_pem = entry.get("certificate_signing_request", "").strip()
-            cert_pem = entry.get("certificate")
-            ca_pem = entry.get("ca")
-            chain_list = entry.get("chain") or []
-            if not (csr_pem and cert_pem and ca_pem):
-                continue
-            csr_sha = CertificateSigningRequest.from_string(csr_pem).get_sha256_hex()
-            rec = self._lookup_csr_record(csr_sha)
-            if not rec:
-                continue
-            self._publish_to_legacy(rec, cert_pem, ca_pem, chain_list)
-
-    def _lookup_csr_record(self, csr_sha: str) -> Optional[CsrRecord]:
-        payload = self.state.csr_map.get(csr_sha)
-        return CsrRecord(**json.loads(payload)) if payload else None
 
     def _publish_to_legacy(
-        self, rec: CsrRecord, cert_pem: str, ca_pem: str, chain_list: List[str]
+        self, rec: CsrRecord, cert_pem: str, ca_pem: str, chain_list: List[str],
+        key_pem: str,
     ) -> None:
         legacy_rel = self.model.get_relation("legacy-certificates", rec.legacy_relation_id)
         if not legacy_rel:
             logger.warning("legacy relation %s not found for CSR %s", rec.legacy_relation_id, rec.csr_sha)
-            return
-        # Load the private key from secret
-        try:
-            secret = self.model.get_secret(label=rec.secret_label)
-            key_pem = secret.get_content(refresh=True).get("private-key")
-        except Exception:
-            logger.warning("secret %s not available for CSR %s", rec.secret_label, rec.csr_sha)
             return
 
         # Publish CA/chain globally (v1 expects one CA+chain across clients)
