@@ -180,7 +180,7 @@ class CertificateTranslatorCharm(CharmBase):
             filtered_req = V1Request(
                 req_type=req.req_type,
                 unit_key=req.unit_key,
-                cn=req.cn if not _is_non_public_domain(req.cn) else req.sans[0] if req.sans else req.cn,
+                cn=req.cn,
                 sans=_filter_non_public_sans(req.sans),
                 is_top_level_server=req.is_top_level_server,
             )
